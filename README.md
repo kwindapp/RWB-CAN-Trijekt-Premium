@@ -1,4 +1,4 @@
-- CAN BUS RWB Janine Display ESP32
+- CAN BUS RWB Janine Display ESP32 https://www.instagram.com/rwb_janine/
 - Trijekt Premium
 - Trijekt CAN Setup NR.2
 https://motorsteuerung-trijekt.de/de/downloads.php
