@@ -1,4 +1,5 @@
 -Added Waveshare CAN data forward over ESP Now to Lilygo S3 T Display Board
+https://github.com/kwindapp/S3_RWB_GAUGE_EXAMPLE.git
 
 - CAN BUS RWB Janine Display ESP32 https://www.instagram.com/rwb_janine/
 - Trijekt Premium
