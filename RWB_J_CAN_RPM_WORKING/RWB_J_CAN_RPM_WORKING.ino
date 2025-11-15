@@ -3,6 +3,8 @@
 #include <Arduino_GFX_Library.h>
 #include "waveshare_twai_port.h"
 #include <bb_captouch.h>
+#include <WiFi.h>
+#include <esp_now.h>
 
 // =====================================================
 // DISPLAY (Waveshare ESP32-S3 4.3" 800×480 RGB LCD)
@@ -49,12 +51,13 @@ const uint32_t ID_STATUS_B     = ID_A + 0x01;    // Drosselklappe / Gaspedalstel
 const uint32_t ID_TEMP_A       = ID_A + 0x02;    // Temperaturen A (Motor temp)
 const uint32_t ID_BATT_VOLT    = ID_B + 0x01;    // Analoge Eingänge A (Batt, bytes 3:4)
 
-// ***** NEW: Funktionseingang status over CAN *****
-const uint32_t ID_FUNC_STATUS  = ID_A + 0x03;    // <--- PLACEHOLDER, CHANGE TO REAL ID
-const uint8_t  FUNC_BYTE_INDEX = 0;             // which data byte (0–7) has the bit
-const uint8_t  FUNC_PIN38_MASK = 0x01;          // which bit in that byte is pin 38 (0x01..0x80)
+// ***** Funktionseingang status over CAN *****
+// TODO: set correct ID + byte/bit for your ECU
+const uint32_t ID_FUNC_STATUS  = ID_A + 0x03;    // placeholder
+const uint8_t  FUNC_BYTE_INDEX = 0;
+const uint8_t  FUNC_PIN38_MASK = 0x01;
 
-// Scaling factors from Trijekt docs
+// Scaling factors
 const float RPM_FACTOR      = 1.23f;   // example: raw * 1.23 = RPM
 const float MOTOR_FACTOR    = 0.1f;    // 0.1 °C
 const float BATT_FACTOR     = 0.001f;  // 1 mV = 0.001 V
@@ -70,7 +73,7 @@ float throttle_pedal_filtered     = 0.0f;
 const uint16_t MAX_RPM = 8000;
 uint16_t rpm_max = 0;
 
-// RPM timeout: if no frame for this long -> rpm = 0
+// RPM timeout
 const uint32_t RPM_TIMEOUT_MS = 500;
 uint32_t lastRpmUpdateMs = 0;
 
@@ -82,6 +85,20 @@ bool funk_active = false;
 // =====================================================
 uint16_t bgColor = BLACK;
 uint16_t fgColor = WHITE;
+
+// =====================================================
+// ESP-NOW PACKET
+// =====================================================
+typedef struct {
+  uint16_t rpm;
+  float batt;
+  float motor;
+  float dk;
+  float gp;
+  uint8_t funk;
+} DashPacket;
+
+uint8_t broadcastAddress[] = { 0x30, 0x30, 0xF9, 0x34, 0x7A, 0x78 }; //LilygoMac
 
 // =====================================================
 // HELPERS
@@ -112,7 +129,7 @@ int BTN_THEME_W = 220;
 int BTN_THEME_H = 60;
 int BTN_SPACE   = 60;
 
-// *** MOVED TO THE RIGHT ***
+// buttons on the right
 int BTN_THEME_X = SCREEN_W - (2 * BTN_THEME_W + BTN_SPACE) - 40;
 int BTN_THEME_Y = SCREEN_H - 80;
 
@@ -147,26 +164,21 @@ void toggleTheme() {
 // FUNKTIONSEINGANG STATUS INDICATOR
 // =====================================================
 void drawFunkButton(bool active) {
-  // Center of the circle, near bottom-left, aligned near buttons
   int r  = 20;
-  int cx = 80;                 // X center of circle
-  int cy = SCREEN_H - 50;      // Y center of circle (a bit above bottom)
+  int cx = 80;
+  int cy = SCREEN_H - 50;
 
-  // Clear a rectangle that fully covers circle + text
   int clearX = cx - r - 10;
   int clearY = cy - r - 10;
-  int clearW = 200;            // enough for circle + "FuncPin 38"
+  int clearW = 200;
   int clearH = r*2 + 20;
   gfx->fillRect(clearX, clearY, clearW, clearH, bgColor);
 
-  // Draw circle (red or green)
-  uint16_t color = active ? gfx->color565(0, 200, 0)   // green
-                          : gfx->color565(220, 0, 0);  // red
+  uint16_t color = active ? gfx->color565(0, 200, 0) : gfx->color565(220, 0, 0);
 
   gfx->fillCircle(cx, cy, r, color);
   gfx->drawCircle(cx, cy, r, fgColor);
 
-  // Label
   gfx->setTextSize(2);
   gfx->setTextColor(fgColor, bgColor);
   gfx->setCursor(cx + r + 10, cy - 7);
@@ -180,7 +192,6 @@ void drawUI() {
   gfx->fillScreen(bgColor);
   gfx->setTextColor(fgColor, bgColor);
 
-  // Header centered
   gfx->setTextSize(3);
   const char *title = "RWB JANINE DASH";
   int16_t x1, y1; uint16_t w, h;
@@ -188,12 +199,10 @@ void drawUI() {
   gfx->setCursor((SCREEN_W - w) / 2, 20);
   gfx->print(title);
 
-  // Max RPM label
   gfx->setTextSize(2);
   gfx->setCursor(SCREEN_W - 200, 20);
   gfx->print("Max RPM:");
 
-  // RPM bar frame
   int gx = 60, gy = 110, gw = SCREEN_W - 120, gh = 60;
   gfx->setTextSize(3);
   gfx->setCursor(gx, gy - 40);
@@ -201,7 +210,6 @@ void drawUI() {
 
   gfx->drawRect(gx, gy, gw, gh, fgColor);
 
-  // scale ticks
   gfx->setTextSize(2);
   for (int rpm = 0; rpm <= MAX_RPM; rpm += 1000) {
     float frac = (float)rpm / MAX_RPM;
@@ -213,55 +221,47 @@ void drawUI() {
   gfx->setCursor(gx + gw - 400, gy - 20);
   gfx->print("x1000 rpm");
 
-  // Big RPM value area
   gfx->fillRect(gx + 160, gy + gh + 50, 260, 60, bgColor);
 
-  // Boxes (Batt / Motor / Throttle)
-  int cardTop = 260 + 20;  // moved 20px down
+  int cardTop = 260 + 20;
   int cardHeight = 90;
   int cardMargin = 20;
   int cardWidth = (SCREEN_W - 4 * cardMargin) / 3;
 
-  // Box 1: Battery Voltage
   int c1x = cardMargin;
   gfx->drawRoundRect(c1x, cardTop, cardWidth, cardHeight, 12, fgColor);
   gfx->setCursor(c1x + 10, cardTop + 10);
   gfx->print("Batt V");
 
-  // Box 2: Motor Temp
   int c2x = c1x + cardWidth + cardMargin;
   gfx->drawRoundRect(c2x, cardTop, cardWidth, cardHeight, 12, fgColor);
   gfx->setCursor(c2x + 10, cardTop + 10);
   gfx->print("Motor");
 
-  // Box 3: Throttle (Drossel + Pedal)
   int c3x = c2x + cardWidth + cardMargin;
   gfx->drawRoundRect(c3x, cardTop, cardWidth, cardHeight, 12, fgColor);
   gfx->setCursor(c3x + 10, cardTop + 10);
   gfx->print("Throttle");
 
-  // Buttons (now right-aligned)
-  drawButton(BTN_THEME_X, BTN_THEME_Y, BTN_THEME_W, BTN_THEME_H, "Touch 1");
-  drawButton(BTN_RESET_X, BTN_RESET_Y, BTN_THEME_W, BTN_THEME_H, "Touch 2");
+  drawButton(BTN_THEME_X, BTN_THEME_Y, BTN_THEME_W, BTN_THEME_H, "Theme");
+  drawButton(BTN_RESET_X, BTN_RESET_Y, BTN_THEME_W, BTN_THEME_H, "Reset Max");
 
-  // Funktionseingang indicator (initial draw)
   drawFunkButton(funk_active);
 }
 
 // =====================================================
-// RPM BAR with minimal redraw (less flicker)
+// RPM BAR
 // =====================================================
 void drawRPMBar(uint16_t rpm) {
-  static int lastFw = 0;  // last bar width in pixels
+  static int lastFw = 0;
 
   int gx = 60, gy = 110, gw = SCREEN_W - 120, gh = 60;
 
   float frac = (float)rpm / MAX_RPM;
   if (frac > 1) frac = 1;
-  int fw = frac * (gw - 4);  // new bar width
+  int fw = frac * (gw - 4);
 
   if (fw > lastFw) {
-    // RPM increased: draw ONLY the new part
     for (int x = lastFw; x < fw; x++) {
       float t = (float)x / (gw - 4);
       uint16_t c =
@@ -271,7 +271,6 @@ void drawRPMBar(uint16_t rpm) {
       gfx->drawFastVLine(gx + 2 + x, gy + 2, gh - 4, c);
     }
   } else if (fw < lastFw) {
-    // RPM decreased: clear ONLY the now-unused part
     gfx->fillRect(gx + 2 + fw, gy + 2, (lastFw - fw), gh - 4, bgColor);
   }
 
@@ -284,19 +283,16 @@ void drawRPMBar(uint16_t rpm) {
 void updateText() {
   gfx->setTextColor(fgColor, bgColor);
 
-  // Max RPM
   gfx->fillRect(SCREEN_W - 100, 15, 90, 25, bgColor);
   gfx->setCursor(SCREEN_W - 100, 18);
   gfx->printf("%5u", rpm_max);
 
-  // Big RPM
   int gx = 60, gy = 110, gh = 60;
   gfx->fillRect(gx + 160, gy + gh + 50, 260, 60, bgColor);
   gfx->setTextSize(5);
   gfx->setCursor(gx + 160, gy + gh + 55);
   gfx->printf("%5u", ecu.rpm);
 
-  // Boxes: Batt / Motor / Throttle
   int cardTop = 260 + 20;
   int cardMargin = 20;
   int cardWidth = (SCREEN_W - 4 * cardMargin) / 3;
@@ -306,24 +302,37 @@ void updateText() {
   int c2x = c1x + cardWidth + cardMargin;
   int c3x = c2x + cardWidth + cardMargin;
 
-  // Battery Voltage
   gfx->setTextSize(3);
+
   gfx->fillRect(c1x + 10, valY, cardWidth - 20, 40, bgColor);
   gfx->setCursor(c1x + 10, valY + 5);
   gfx->printf("%4.1f V", ecu.batt);
 
-  // Motor Temp
   gfx->fillRect(c2x + 10, valY, cardWidth - 20, 40, bgColor);
   gfx->setCursor(c2x + 10, valY + 5);
   gfx->printf("%5.1f C", ecu.motor);
 
-  // Throttle box: show BOTH DK and GP with markers
   gfx->fillRect(c3x + 10, valY, cardWidth - 20, 40, bgColor);
   gfx->setTextSize(2);
-  gfx->setCursor(c3x + 10, valY);        // first line
+  gfx->setCursor(c3x + 10, valY);
   gfx->printf("DK %4.1f%%", ecu.throttle_dk);
-  gfx->setCursor(c3x + 10, valY + 22);   // second line
+  gfx->setCursor(c3x + 10, valY + 22);
   gfx->printf("GP %4.1f%%", ecu.throttle_pedal);
+}
+
+// =====================================================
+// ESP-NOW SEND
+// =====================================================
+void sendEspNow() {
+  DashPacket p;
+  p.rpm   = ecu.rpm;
+  p.batt  = ecu.batt;
+  p.motor = ecu.motor;
+  p.dk    = ecu.throttle_dk;
+  p.gp    = ecu.throttle_pedal;
+  p.funk  = funk_active ? 1 : 0;
+
+  esp_now_send(broadcastAddress, (uint8_t*)&p, sizeof(p));
 }
 
 // =====================================================
@@ -331,7 +340,6 @@ void updateText() {
 // =====================================================
 void decodeTrijekt(const twai_message_t &m) {
 
-  // RPM (ID_A)
   if (m.identifier == ID_RPM && m.data_length_code >= 2) {
     uint16_t raw = U16BE(m, 0);
     uint16_t rpm = raw * RPM_FACTOR;
@@ -340,35 +348,28 @@ void decodeTrijekt(const twai_message_t &m) {
     ecu.rpm = rpm_filtered;
 
     if (ecu.rpm > rpm_max) rpm_max = ecu.rpm;
-
-    // update RPM timestamp for timeout
     lastRpmUpdateMs = millis();
   }
 
-  // Motor Temperature (Temperaturen A, bytes 1:2)
   if (m.identifier == ID_TEMP_A && m.data_length_code >= 2) {
-    int16_t raw = (int16_t)U16BE(m, 0); // bytes 1:2
+    int16_t raw = (int16_t)U16BE(m, 0);
     float temp = raw * MOTOR_FACTOR;
     motor_filtered = (motor_filtered * 3 + temp) / 4.0f;
     ecu.motor = motor_filtered;
   }
 
-  // Battery Voltage (Analoge Eingänge A, bytes 3:4)
   if (m.identifier == ID_BATT_VOLT && m.data_length_code >= 4) {
-    int16_t raw = (int16_t)U16BE(m, 2);  // bytes 3:4
+    int16_t raw = (int16_t)U16BE(m, 2);
     float v = raw * BATT_FACTOR;
     batt_filtered = (batt_filtered * 3 + v) / 4.0f;
     ecu.batt = batt_filtered;
   }
 
-  // Statusdaten B: Drosselklappe (1:2) + Gaspedalstellung (3:4)
   if (m.identifier == ID_STATUS_B && m.data_length_code >= 4) {
-    // Drosselklappe
-    int16_t raw_dk = (int16_t)U16BE(m, 0);  // bytes 1:2
+    int16_t raw_dk = (int16_t)U16BE(m, 0);
     float dk = raw_dk * THROTTLE_FACTOR;
 
-    // Gaspedalstellung
-    int16_t raw_gp = (int16_t)U16BE(m, 2);  // bytes 3:4
+    int16_t raw_gp = (int16_t)U16BE(m, 2);
     float gp = raw_gp * THROTTLE_FACTOR;
 
     throttle_dk_filtered     = (throttle_dk_filtered * 3 + dk) / 4.0f;
@@ -378,11 +379,9 @@ void decodeTrijekt(const twai_message_t &m) {
     ecu.throttle_pedal  = throttle_pedal_filtered;
   }
 
-  // ***** Funktionseingang status frame *****
   if (m.identifier == ID_FUNC_STATUS && m.data_length_code > FUNC_BYTE_INDEX) {
     uint8_t byteVal = m.data[FUNC_BYTE_INDEX];
     bool newState = (byteVal & FUNC_PIN38_MASK) != 0;
-
     if (newState != funk_active) {
       funk_active = newState;
       drawFunkButton(funk_active);
@@ -414,6 +413,28 @@ void handleTouch() {
 }
 
 // =====================================================
+// ESP-NOW INIT
+// =====================================================
+void initEspNow() {
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed!");
+    return;
+  }
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  peerInfo.channel = 0;   // current WiFi channel
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("ESP-NOW add peer failed!");
+  }
+}
+
+// =====================================================
 // SETUP
 // =====================================================
 void setup() {
@@ -428,7 +449,8 @@ void setup() {
 
   can_ok = waveshare_twai_init();
 
-  // Start with RPM timeout base
+  initEspNow();
+
   lastRpmUpdateMs = millis();
 }
 
@@ -445,7 +467,6 @@ void loop() {
     }
   }
 
-  // If no RPM frame recently, force RPM to 0
   if (millis() - lastRpmUpdateMs > RPM_TIMEOUT_MS && ecu.rpm != 0) {
     ecu.rpm = 0;
     rpm_filtered = 0;
@@ -456,6 +477,7 @@ void loop() {
   if (millis() - lastUI > 100) {
     drawRPMBar(ecu.rpm);
     updateText();
+    sendEspNow();          // <<< send to LilyGo
     lastUI = millis();
   }
 }
