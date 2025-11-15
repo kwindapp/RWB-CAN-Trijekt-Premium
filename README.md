@@ -1,3 +1,5 @@
+-Added Waveshare CAN data forward over ESP Now to Lilygo S3 T Display Board
+
 - CAN BUS RWB Janine Display ESP32 https://www.instagram.com/rwb_janine/
 - Trijekt Premium
 - Trijekt CAN Setup NR.2
